@@ -1,0 +1,1861 @@
+{
+    "AWSTemplateFormatVersion" : "2010-09-09",
+	"Transform" : "AWS::Serverless-2016-10-31",
+    "Description"              : "Credit Card purchase delivery stream for fraud detection",
+
+    "Parameters"               : {
+        "StreamName" : {
+            "Description" : "The stream name",
+            "Type"        : "String",
+            "Default"     : "cc-fraud-click-stream",
+            "MinLength"   : 1
+        },
+        "ShardCount" : {
+            "Description" : "The number of shards to use.",
+            "Type"        : "Number",
+            "MinValue"    : 1,
+            "MaxValue"    : 10,
+            "Default"     : 1
+        },
+
+        "StreamingIngestBucketName" : {
+            "Description" : "The name of the bucket that Kinesis Firehose will deliver raw transactions to. The puts to this bucket will trigger an SNS that initiates an external Lambda function that will convert the key prefix to a Hive compatible format and then deletes the contents.",
+            "Type"        : "String",
+            "Default"     : "cc-transactions-raw",
+			"MinLength"   : 3,
+            "MaxLength"   : 63,
+            "AllowedPattern" : "^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$"
+        },
+		"CreditCardTransactionsBucketName" : {
+            "Description" : "The name of the bucket where raw transactions can be read and queried from. This bucket should already exist (as a result of the Lambda function that performs the hive key partition transformation).",
+            "Type"        : "String",
+            "Default"     : "cc-transactions-processed",
+			"MinLength"   : 3,
+            "MaxLength"   : 63,
+            "AllowedPattern" : "^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$"
+        },
+		"CreditCardTransactionsBucketNamePostETL" : {
+			"Description" : "The name of the bucket the AWS Glue ETL will place the transformation results in. This bucket will be created",
+			"Type" : "String",
+			"Default" : "cc-record-post-etl",
+			"MinLength"   : 3,
+            "MaxLength"   : 63,
+            "AllowedPattern" : "^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]$"
+		},
+
+        "DeliveryStreamBuffering" : {
+            "Description" : "The number of seconds before the stream will make a new delivery",
+            "Type"        : "Number",
+            "MinValue"    : 60,
+            "MaxValue"    : 900,
+            "Default"     : 60
+        },
+		"LogRetentionInDays" : {
+            "Type" : "Number",
+            "Description" : "The number of days to retain the CloudWatch Logs for the function. If this is set to 0, it will be infinite retention.",
+            "MinValue"    : 0,
+            "Default"     : 7
+        },
+		"AwaiterArn" : {
+			"Type" : "String",
+			"Description" : "The Arn of the Kinesis Awaiter function.",
+			"Default" : "arn:aws:lambda:us-east-1:123456789012:function:KinesisStreamAwaiter",
+            "AllowedPattern" : "^arn:aws(?:-us-gov|-cn|-iso(?:-b)?)?:lambda:.*?:[0-9]{12}:function:.*$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^arn:aws(?:-us-gov|-cn|-iso(?:-b)?)?:lambda:.*?:[0-9]{12}:function:.*$"
+		},
+
+		"SageMakerEndpoint" : {
+			"Description" : "The SageMaker endpoint to run transactions against.",
+			"Type" : "String",
+			"AllowedPattern" : "^[a-zA-Z0-9](-*[a-zA-Z0-9])*",
+			"Default" : "credit-card-fraud-detector"
+		},
+		
+		"NotificationEmail" : {
+			"Description" : "The email address to send fraud alerts to.",
+			"Type" : "String",
+			"MinLength": 5
+		},
+		"FailureNotificationEmail" : {
+			"Description" : "The email address to notifications during a lambda execution failure.",
+			"Type" : "String",
+			"MinLength": 5
+		},
+
+		"RawTransactionsTableName" : {
+			"Description" : "The table name that will hold the raw transaction records.",
+			"Type" : "String",
+			"Default" : "rawcctransactions"
+		},	
+		"TransformedTransactionsTableName" : {
+			"Description" : "The table name that will hold the transformed transaction records.",
+			"Type" : "String",
+			"Default" : "cctransactions"
+		},
+
+		"HivePrefixConverterLambdaName" : {
+			"Description" : "The name of the lambda function that will be triggered when a new cc transaction is delivered by kinesis firehose.",
+			"Type" : "String",
+			"Default" : "S3KeyToHivePartition"
+		},
+		"ETLScriptLocation" : {
+			"Type" : "String",
+			"Description" : "Specify an s3 location where the python script for processing CSV files exists in the s3://bucket/path/object.py format. If you leave this blank, the default s3 location for glue is used.",
+			"AllowedPattern" : "(?:^$|^s3://[a-z](?:(?:\\.(?!\\.))|-|[a-zA-Z0-9]){1,61}[a-z]/.*$)"
+		},
+		
+		"OrganizationTag"    : {
+            "Description" : "The organization this account is associated with",
+            "Type"        : "String",
+            "AllowedPattern" : "^\\S{2,}$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^\\S{2,}$"
+        },
+        "ApplicationTag"     : {
+            "Description" : "The application this account is associated with",
+            "Type"        : "String",
+            "AllowedPattern" : "^\\S{2,}$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^\\S{2,}$"
+        },
+        "EnvironmentTag"     : {
+            "Description" : "The environment this account is associated with",
+            "Type"        : "String",
+            "AllowedPattern" : "^\\S{2,}$",
+            "ConstraintDescription" : "Member must satisfy regular expression pattern: ^\\S{2,}$"
+        }
+    },
+
+	"Metadata" : {
+		"AWS::CloudFormation::Interface" : {
+			"ParameterGroups" : [
+				{
+					"Label" : {
+						"default" : "S3 Bucket Configuration"
+					},
+					"Parameters" : [
+						"StreamingIngestBucketName",
+						"CreditCardTransactionsBucketName",
+						"CreditCardTransactionsBucketNamePostETL",
+						"HivePrefixConverterLambdaName"
+					]
+				},
+				{
+					"Label" : {
+						"default" : "Kinesis Configuration"
+					},
+					"Parameters" : [
+						"StreamName",
+						"ShardCount",
+						"DeliveryStreamBuffering",
+						"AwaiterArn"
+					]
+				},
+				{
+					"Label" : {
+						"default" : "Firehose Lambda Transform Configuration"
+					},
+					"Parameters" : [
+						"SageMakerEndpoint",
+						"NotificationEmail",
+						"FailureNotificationEmail",
+						"LogRetentionInDays"
+					]
+				},
+				{
+					"Label" : {
+						"default" : "AWS Glue & Athena Configuration"
+					},
+					"Parameters" : [
+						"RawTransactionsTableName",
+						"TransformedTransactionsTableName"
+					]
+				},
+				{
+					"Label" : {
+						"default" : "Tagging"
+					},
+					"Parameters" : [
+						"OrganizationTag",
+						"ApplicationTag",
+						"EnvironmentTag"
+					]
+				}
+				
+			]
+		}
+	},
+
+	"Conditions"               : {
+        "InfiniteRetention" : {
+            "Fn::Equals" : [
+                {
+                    "Ref" : "LogRetentionInDays"
+                },
+                0
+            ]
+        },
+		"SpecifiedScriptLocation" : {
+			"Fn::Not" : [
+				{
+					"Fn::Equals" : [
+						{
+							"Ref" : "ETLScriptLocation"
+						},
+						""
+					]
+				}
+			]
+		}
+    },
+
+	"Mappings" : {
+		"Internal" : {
+			"Lambda" : {
+				"FunctionName" : "FirehoseSageMakerFraudCheck"
+			}
+		}
+	},
+
+    "Resources"                : {
+		"StreamingIngestBucket" : {
+            "Type" : "AWS::S3::Bucket",
+            "Properties" : {
+                "BucketName" : {
+                    "Ref" : "StreamingIngestBucketName"
+                },
+				"NotificationConfiguration" : {
+					"TopicConfigurations" : [
+						{
+						 "Event" : "s3:ObjectCreated:*",
+						  "Topic" : {
+							"Ref" : "LambdaSNSLauncher"
+						  }
+						}
+					]
+				},
+                "Tags"       : [
+                    {
+                        "Key" : "Environment",
+                        "Value" : {
+                            "Ref" : "EnvironmentTag"
+                        }
+                    },
+                    {
+                        "Key" : "Application",
+                        "Value" : {
+                            "Ref" : "ApplicationTag"
+                        }
+                    },
+                    {
+                        "Key" : "Organization",
+                        "Value" : {
+                            "Ref" : "OrganizationTag"
+                        }
+                    }
+                ]            
+            },
+			"DependsOn" : [
+				"LambdaSNSLauncherPolicy"
+			]
+        },	
+
+		"PostGlueETLS3Bucket" : {
+            "Type" : "AWS::S3::Bucket",
+            "Properties" : {
+                "BucketName" : {
+                    "Ref" : "CreditCardTransactionsBucketNamePostETL"
+                },
+				"Tags"       : [
+                    {
+                        "Key" : "Environment",
+                        "Value" : {
+                            "Ref" : "EnvironmentTag"
+                        }
+                    },
+                    {
+                        "Key" : "Application",
+                        "Value" : {
+                            "Ref" : "ApplicationTag"
+                        }
+                    },
+                    {
+                        "Key" : "Organization",
+                        "Value" : {
+                            "Ref" : "OrganizationTag"
+                        }
+                    }
+                ]            
+            }
+        },
+
+		"LambdaSNSLauncherPolicy": {
+			"Type" : "AWS::SNS::TopicPolicy",
+			"Properties" : {
+				"PolicyDocument" : {
+					"Id" : "LambdaSNSLauncherPolicy",
+					"Version" : "2012-10-17",
+					"Statement" : [
+						{
+							"Sid" : "1",
+							"Effect" : "Allow",
+							"Principal" : {
+								"Service" : "s3.amazonaws.com"
+							},
+							"Action" : [
+								"sns:Publish"
+							],
+							"Resource" : [
+								"*"
+							],
+							"Condition" : {
+								"ArnLike" : {
+									"aws:SourceArn" : {
+										"Fn::Sub" : "arn:aws:s3:*:*:${StreamingIngestBucketName}"
+									}
+								}
+							}
+						}
+					]
+				},
+				"Topics" : [
+					{
+						"Ref" : "LambdaSNSLauncher"
+					}
+				]
+			}
+		},
+
+		"LambdaSNSLauncher" : {
+			"Type" : "AWS::SNS::Topic",
+            "Properties" : {
+                "DisplayName" : "CCStreamIngest",
+				 "Subscription" : [		
+					{
+						"Protocol" : "lambda",
+						"Endpoint" : {
+							"Fn::Sub" : "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${HivePrefixConverterLambdaName}"
+						}
+					}
+				 ],
+                "TopicName"   : "CCStreamIngest"				
+            }
+		},
+
+        "KinesisCreditCardTransactionStream" : {
+            "Type" : "AWS::Kinesis::Stream",
+            "Properties" : {
+                "Name" : {
+                    "Ref" : "StreamName"
+                },
+                "ShardCount" : {
+                    "Ref" : "ShardCount"
+                }
+            }
+        },
+
+		"KinesisStreamAwaiter" : {
+			"Type" : "Custom::KinesisStreamAwaiter",
+			"Properties" : {
+				"ServiceToken" : {
+					"Ref" : "AwaiterArn"
+				},
+				"StreamName" : {
+					"Ref" : "KinesisCreditCardTransactionStream"
+				}
+			}
+		},
+
+        "FirehoseRole"       : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "RoleName" : "CCFraud-FirehoseRole",
+                "AssumeRolePolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : {
+                                "Service" : [
+                                    "firehose.amazonaws.com"
+                                ]
+                            },
+                            "Action"    : [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        "FirehoseKinesisPolicy" : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "KinesisGetRecordPolicy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "kinesis:DescribeStream",
+								"kinesis:GetShardIterator",
+								"kinesis:GetRecords"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::GetAtt" : [
+                                        "KinesisCreditCardTransactionStream",
+                                        "Arn"
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "FirehoseRole"
+                    }
+                ]
+            },
+            "Description" : "Allows Kinesis Firehose to use Kinesis as an input."
+        },
+        "FirehoseS3Policy"      : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "KinesisS3Policy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:AbortMultipartUpload",
+                                "s3:GetObject",
+                                "s3:PutObject"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::Sub" : "arn:aws:s3:::${StreamingIngestBucket}/*"
+                                }
+                            ]
+                        },
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:GetBucketLocation",
+                                "s3:ListBucket",
+                                "s3:ListBucketMultipartUploads"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::Sub" : "arn:aws:s3:::${StreamingIngestBucket}"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "FirehoseRole"
+                    }
+                ]
+            },
+            "Description" : "Allows Kinesis Firehose to write out to S3."
+        },
+        "FirehoseCloudWatchLogsAccessPolicy" : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "CloudWatchLogsAccessPolicy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:CreateLogGroup",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents",
+                                "logs:DescribeLogStreams",
+                                "logs:DescribeLogGroups"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::Sub" : "arn:aws:logs:*:${AWS::AccountId}:*"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "FirehoseRole"
+                    }
+                ]
+            }
+        },
+		"FirehoseLambdaAccessPolicy" : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "LambdaAccessPolicy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "lambda:InvokeFunction",
+                          "lambda:GetFunctionConfiguration"
+                        ],
+                        "Resource": {
+                          "Fn::GetAtt": [ "FirehoseSageMakerFraudCheck", "Arn" ]
+                        }
+                      }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "FirehoseRole"
+                    }
+                ]
+            }
+        },		
+
+        "FirehoseDeliveryStream"             : {
+            "Type" : "AWS::KinesisFirehose::DeliveryStream",
+            "Properties" : {
+                "DeliveryStreamName" : "CreditCardTransactionDeliveryStream",
+                "DeliveryStreamType" : "KinesisStreamAsSource",
+                "KinesisStreamSourceConfiguration" : {
+                    "KinesisStreamARN" : {
+                        "Fn::GetAtt" : [
+                            "KinesisCreditCardTransactionStream",
+                            "Arn"
+                        ]
+                    },
+                    "RoleARN"          : {
+                        "Fn::GetAtt" : [
+                            "FirehoseRole",
+                            "Arn"
+                        ]
+                    }
+                },
+                "ExtendedS3DestinationConfiguration" : {
+                    "BucketARN" : {
+                        "Fn::Sub" : "arn:aws:s3:::${StreamingIngestBucket}"
+                    },
+                    "BufferingHints" : {
+                        "IntervalInSeconds" : {
+                            "Ref" : "DeliveryStreamBuffering"
+                        },
+                        "SizeInMBs"         : 1
+                    },
+                    "CloudWatchLoggingOptions" : {
+                        "Enabled" : true,
+                        "LogGroupName" : "credit-card-transaction-delivery",
+                        "LogStreamName" : "s3delivery"
+                    },
+                    "CompressionFormat"        : "UNCOMPRESSED",
+					"Prefix" : "",
+                    "RoleARN"                  : {
+                        "Fn::GetAtt" : [
+                            "FirehoseRole",
+                            "Arn"
+                        ]
+                    },
+					"ProcessingConfiguration" : {
+						"Enabled" : true,
+						"Processors" : [
+							{
+								"Type" : "Lambda",
+								"Parameters" : [
+									{
+										 "ParameterName" : "LambdaArn",
+										 "ParameterValue" : {
+											"Fn::GetAtt" : [ "FirehoseSageMakerFraudCheck", "Arn"]
+										 }
+									}								
+								]
+							}
+						]
+					}
+                }
+            },
+			"DependsOn" : [
+				"KinesisStreamAwaiter",
+				"FirehoseKinesisPolicy"
+			]
+        },
+        "ApiGatewayRole"                     : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "RoleName" : "CCFraud-ApiGatewayKinesisRole",
+                "AssumeRolePolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : {
+                                "Service" : [
+                                    "apigateway.amazonaws.com"
+                                ]
+                            },
+                            "Action"    : [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        "ApiGatewayKinesisPolicy"            : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "KinesisPutRecordPolicy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "kinesis:PutRecord"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::GetAtt" : [
+                                        "KinesisCreditCardTransactionStream",
+                                        "Arn"
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "ApiGatewayRole"
+                    }
+                ]
+            },
+            "Description" : "Allows API Gateway to put records in a Kinesis Stream."
+        },
+
+        "CreditCardTransactionApi"                          : {
+            "Type" : "AWS::ApiGateway::RestApi",
+            "Properties" : {
+                "Name" : "CreditCardTransactionApi",
+                "Description" : "Takes credit card transaction data and feeds it to Kinesis",
+                "Body"        : {
+                    "swagger" : "2.0",
+                    "info"    : {
+                        "title" : "CreditCardTransactionApi"
+                    },
+                    "basePath" : "/",
+                    "schemes"  : [
+                        "https"
+                    ],
+                    "paths"    : {
+                        "/{stream-name}" : {
+                            "post" : {
+                                "consumes" : [
+                                    "application/json"
+                                ],
+                                "produces" : [
+                                    "application/json"
+                                ],
+                                "parameters" : [
+                                    {
+                                        "name" : "stream-name",
+                                        "in"   : "path",
+                                        "required" : true,
+                                        "type"     : "string"
+                                    }
+                                ],
+                                "responses"  : {
+                                    "201" : {
+                                        "description" : "201 Created Response",
+                                        "schema"      : {
+                                            "$ref" : "#/definitions/Empty"
+                                        }
+                                    }
+                                },
+                                "x-amazon-apigateway-integration" : {
+                                    "credentials" : {
+                                        "Fn::GetAtt" : [
+                                            "ApiGatewayRole",
+                                            "Arn"
+                                        ]
+                                    },
+                                    "uri"         : "arn:aws:apigateway:us-east-1:kinesis:action/PutRecord",
+                                    "responses"   : {
+                                        "default" : {
+                                            "statusCode" : "201"
+                                        }
+                                    },
+                                    "passthroughBehavior" : "when_no_templates",
+                                    "httpMethod"          : "POST",
+                                    "requestTemplates"    : {
+                                        "application/json" : "{\n    \"StreamName\": \"$input.params('stream-name')\",\n    \"Data\": \"$util.base64Encode($input.body)\",\n    \"PartitionKey\": \"1\"\n}"
+                                    },
+                                    "type"                : "aws"
+                                }
+                            },
+                            "options" : {
+                                "consumes" : [
+                                    "application/json"
+                                ],
+                                "produces" : [
+                                    "application/json"
+                                ],
+                                "responses" : {
+                                    "200" : {
+                                        "description" : "200 response",
+                                        "schema"      : {
+                                            "$ref" : "#/definitions/Empty"
+                                        },
+                                        "headers"     : {
+                                            "Access-Control-Allow-Origin" : {
+                                                "type" : "string"
+                                            },
+                                            "Access-Control-Allow-Methods" : {
+                                                "type" : "string"
+                                            },
+                                            "Access-Control-Allow-Headers" : {
+                                                "type" : "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "x-amazon-apigateway-integration" : {
+                                    "responses" : {
+                                        "default" : {
+                                            "statusCode" : "200",
+                                            "responseParameters" : {
+                                                "method.response.header.Access-Control-Allow-Methods" : "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'",
+                                                "method.response.header.Access-Control-Allow-Headers" : "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'",
+                                                "method.response.header.Access-Control-Allow-Origin"  : "'*'"
+                                            }
+                                        }
+                                    },
+                                    "passthroughBehavior" : "when_no_match",
+                                    "requestTemplates"    : {
+                                        "application/json" : "{\"statusCode\": 200}"
+                                    },
+                                    "type"                : "mock"
+                                }
+                            }
+                        }
+                    },
+                    "definitions" : {
+                        "Empty" : {
+                            "type" : "object",
+                            "title" : "Empty Schema"
+                        }
+                    }
+                }
+            }
+        },
+        "ApiGatewayDeployment"               : {
+            "Type" : "AWS::ApiGateway::Deployment",
+            "Properties" : {
+                "RestApiId" : {
+                    "Ref" : "CreditCardTransactionApi"
+                },
+                "Description" : "Credit Card Transaction Api Endpoint Deployment"
+            }
+        },
+        "ApiGatewayStage"                    : {
+            "Type" : "AWS::ApiGateway::Stage",
+            "Properties" : {
+                "Description" : "Production Stage",
+                "DeploymentId" : {
+                    "Ref" : "ApiGatewayDeployment"
+                },
+                "StageName"    : "stream",
+                "RestApiId"    : {
+                    "Ref" : "CreditCardTransactionApi"
+                }
+            }
+        },
+
+		"FirehoseSageMakerFraudCheck" : {
+		      "Type" : "AWS::Serverless::Function",
+		      "Properties": {
+		        "FunctionName" : {
+					"Fn::FindInMap" : [
+						"Internal",
+						"Lambda",
+						"FunctionName"
+					]
+				},
+			    "Description" : "Takes credit card transaction data from a Kinesis Firehose stream and checks for fraudulent activity.",
+			    "Handler": "CreditCardFraudDemo::BAMCIS.LambdaFunctions.CreditCardFraudDemo.Entrypoint::Exec",
+			    "Runtime": "dotnetcore2.1",
+			    "Role" : {
+				    "Fn::GetAtt" : ["LambdaExecutionRole", "Arn" ]
+			    },
+			    "CodeUri": "",
+			    "MemorySize": 512,
+			    "Timeout": 300,
+				"Tracing" : "Active",
+				"Environment" : {
+				 "Variables" : {
+				  "SageMakerEndpoint" : {
+					"Ref" : "SageMakerEndpoint"
+				  },
+				  "SNS" : {
+					"Ref" : "SNSFraudAlertTopic"
+				  }
+				 }
+				},
+				"Tags"       : {
+                    "Name" : {
+						"Fn::FindInMap" : [
+							"Internal",
+							"Lambda",
+							"FunctionName"
+						]
+					},
+                    "Environment" : {
+                        "Ref" : "EnvironmentTag"
+                    },
+                    "Application" : {
+                        "Ref" : "ApplicationTag"
+                    },
+                    "Organization" : {
+                        "Ref" : "OrganizationTag"
+                    }
+                }
+		      },
+				"DependsOn" : [
+					"XRayWriteOnlyPolicy"
+				]
+		    },
+
+		"SNSFraudAlertTopic" : {
+			"Type" : "AWS::SNS::Topic",
+			"Properties" : {
+			  "DisplayName" : "Credit Card Fraud Alerts",
+			  "TopicName" : "cc-fraud-alerts",
+			  "Subscription" : [
+					{
+					 "Protocol" : "email",
+					 "Endpoint" : {
+						"Ref" : "NotificationEmail"
+					 }
+					}				
+			  ]
+			}
+		},
+
+		"LambdaExecutionRole" : {
+                "Type" : "AWS::IAM::Role",
+                "Properties" : {
+                    "RoleName" : "CCFraud-LambdaRole",
+                    "AssumeRolePolicyDocument" : {
+                        "Version" : "2012-10-17",
+                        "Statement" : [
+                            {
+                                "Effect" : "Allow",
+                                "Principal" : {
+                                    "Service" : [
+                                        "lambda.amazonaws.com"
+                                    ]
+                                },
+                                "Action"    : [
+                                    "sts:AssumeRole"
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },    
+		"LambdaCWLPolicy"     : {
+                "Type" : "AWS::IAM::Policy",
+                "Properties" : {
+                    "PolicyName" : "LambdaCWLPolicy",
+                    "PolicyDocument" : {
+                        "Version" : "2012-10-17",
+                        "Statement" : [
+                            {
+                                "Effect" : "Allow",
+                                "Action" : [
+                                    "logs:CreateLogStream",
+                                    "logs:CreateLogGroup",
+                                    "logs:DescribeLogStreams",
+                                    "logs:PutLogEvents",
+                                    "logs:DescribeLogGroups"
+                                ],
+                                "Resource" : {
+									"Fn::Sub" : "arn:aws:logs:*:${AWS::AccountId}:*"
+                                }
+                            }
+                        ]
+                    },
+                    "Roles"          : [
+                        {
+                            "Ref" : "LambdaExecutionRole"
+                        }
+                    ]
+                }
+            },
+		"LambdaSageMakerPolicy" : {
+			"Type" : "AWS::IAM::Policy",
+			"Properties" : {
+				"PolicyName" : "LambdaSageMakerPolicy",
+                    "PolicyDocument" : {
+                        "Version" : "2012-10-17",
+                        "Statement" : [
+                            {
+                                "Effect" : "Allow",
+                                "Action" : [
+                                    "sagemaker:InvokeEndpoint"
+                                ],
+                                "Resource" : {
+                                    "Fn::Sub" : "arn:aws:sagemaker:*:${AWS::AccountId}:endpoint/${SageMakerEndpoint}"
+                                }
+                            }
+                        ]
+                    },
+                    "Roles"          : [
+                        {
+                            "Ref" : "LambdaExecutionRole"
+                        }
+                    ]
+			}
+		},
+		"LambdaSNSPolicy" : {
+			"Type" : "AWS::IAM::Policy",
+			"Properties" : {
+				"PolicyName" : "LambdaSNSPolicy",
+                    "PolicyDocument" : {
+                        "Version" : "2012-10-17",
+                        "Statement" : [
+                            {
+                                "Effect" : "Allow",
+                                "Action" : [
+                                    "sns:Publish"
+                                ],
+                                "Resource" : {
+                                    "Ref" : "SNSFraudAlertTopic"
+                                }
+                            }
+                        ]
+                    },
+                    "Roles"          : [
+                        {
+                            "Ref" : "LambdaExecutionRole"
+                        }
+                    ]
+			}
+		},		
+		"XRayWriteOnlyPolicy" : {
+			"Type" : "AWS::IAM::Policy",
+			"Properties" : {
+				"PolicyName" : "XRayPolicy",
+				"PolicyDocument" : {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Effect": "Allow",
+							"Action": [
+								"xray:PutTraceSegments",
+								"xray:PutTelemetryRecords",
+								"xray:GetSamplingRules",
+								"xray:GetSamplingTargets",
+								"xray:GetSamplingStatisticSummaries"
+							],
+							"Resource": [
+								"*"
+							]
+						}
+					]
+				},
+				"Roles" : [
+					{
+						"Ref" : "LambdaExecutionRole"
+					}
+				]
+			}
+		},
+
+		"CloudWatchLogGroup"  : {
+                "Type" : "AWS::Logs::LogGroup",
+                "Properties" : {
+                    "LogGroupName" : {
+						"Fn::Sub" : [
+							"/aws/lambda/${FunctionName}",
+							{
+								"FunctionName" : {
+									"Fn::FindInMap" : [
+										"Internal",
+										"Lambda",
+										"FunctionName"
+									]
+								}
+							}
+						]
+					},
+                    "RetentionInDays" : {
+                        "Fn::If" : [
+                            "InfiniteRetention",
+                            {
+                                "Ref" : "AWS::NoValue"
+                            },
+                            {
+                                "Ref" : "LogRetentionInDays"
+                            }
+                        ]
+                    }
+                }
+            },
+
+		"GlueServiceRole" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "RoleName" : "AWSGlueServiceRole-CCTransactionCrawler",
+                "AssumeRolePolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sts:AssumeRole"
+                            ],
+                            "Principal" : {
+                                "Service" : [
+                                    "glue.amazonaws.com"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "ManagedPolicyArns"        : [
+                    "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+                ]
+            }
+        },
+        "GlueS3Policy"    : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "GlueS3Policy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:GetObject"
+                            ],
+                            "Resource" : [
+                                {
+									"Fn::If" : [
+										"SpecifiedScriptLocation",
+										{
+											"Fn::Sub" : [ "arn:${AWS::Partition}:s3:::${Bucket}/*",
+												{
+													"Bucket" : {
+														"Fn::Select" : [ 2, {
+																"Fn::Split" : [
+																	"/",
+																	{
+																		"Ref" : "ETLScriptLocation"
+																	}
+																]
+															}
+														]
+													}
+												}
+											]
+										},
+										{
+											"Fn::Sub" : "arn:${AWS::Partition}:s3:::aws-glue-scripts-${AWS::AccountId}-${AWS::Region}/admin/cc_etl.py"
+										}
+									]								                                  
+                                }
+                            ]
+                        },						
+						{
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:GetObject"
+                            ],
+                            "Resource" : [
+                                {
+									"Fn::Sub" :  "arn:aws:s3:::${CreditCardTransactionsBucketName}/*"								                                  
+                                }
+                            ]
+                        },
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:ListBucket"
+                            ],
+                            "Resource" : [
+                                {
+									"Fn::Sub" :  "arn:aws:s3:::${CreditCardTransactionsBucketName}"								                                  
+                                }
+                            ]
+                        },
+						 {
+                            "Effect" : "Allow",
+                            "Action" : [
+								"s3:PutObject",
+								"s3:DeleteObject",
+								"s3:GetObject"
+                            ],
+                            "Resource" : [
+                                {
+									"Fn::Sub" :  "arn:aws:s3:::${PostGlueETLS3Bucket}/*"								                                  
+                                }
+                            ]
+                        },
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "s3:ListBucket"
+                            ],
+                            "Resource" : [
+                                {
+									"Fn::Sub" :  "arn:aws:s3:::${PostGlueETLS3Bucket}"								                                  
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "GlueServiceRole"
+                    }
+                ]
+            }
+        },
+		"GlueKMSPolicy"    : {
+            "Type" : "AWS::IAM::Policy",
+            "Properties" : {
+                "PolicyName" : "GlueKMSPolicy",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {  
+						 "Effect":"Allow",
+						 "Action":[  
+							"kms:Decrypt"
+						 ],
+						 "Resource":[  
+							{
+								"Fn::Sub" : "arn:aws:kms:*:${AWS::AccountId}:key/*"
+							}
+						 ]
+					  }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "GlueServiceRole"
+                    }
+                ]
+            }
+        },
+
+		"GlueDatabase"           : {
+            "Type" : "AWS::Glue::Database",
+            "Properties" : {
+                "CatalogId" : {
+                    "Ref" : "AWS::AccountId"
+                },
+                "DatabaseInput" : {
+                    "Description" : "Credit Card Transaction Data",
+                    "Name"        : "cc_transaction_db"
+                }
+            }
+        },
+        "CCTransactionsGlueCrawler" : {
+            "Type" : "AWS::Glue::Crawler",
+            "Properties" : {
+                "DatabaseName" : {
+                    "Ref" : "GlueDatabase"
+                },
+                "Description"  : "Crawls the credit card transaction data",
+                "Name"         : "CCTransactionsGlueCrawler",
+                "Targets"      : {
+                    "S3Targets" : [
+                        {
+                            "Path" : {
+								"Fn::Sub" : "s3://${CreditCardTransactionsBucketName}"                               
+                            },
+							"Exclusions" : [
+								"**processing-failed/**"
+							]
+                        },
+						{
+                            "Path" : {
+								"Fn::Sub" : "s3://${PostGlueETLS3Bucket}"                               
+                            },
+							"Exclusions" : [
+								"**.json",
+								"_**"
+							]
+                        }
+                    ]
+                },
+                "Role"         : {
+                    "Fn::GetAtt" : [
+                        "GlueServiceRole",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+
+		"GetAllRawTransactionsQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets all of the raw credit card transactions.",
+				 "Name" : "CC-Raw-Transactions-GetAll",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT * FROM \"${GlueDatabase}\".\"${RawTransactionsTableName}\""
+				 }
+			}
+		},
+		"LoadPartitionsRawTableQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Loads new partitions of raw credit card transaction data.",
+				 "Name" : "CC-Raw-Transactions-LoadNewPartitions",
+				 "QueryString" : {
+					"Fn::Sub" : "MSCK REPAIR TABLE ${RawTransactionsTableName}"
+				 }
+			}
+		},
+		"GetAllTransformedTransactionsQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets all of the transformed credit card transactions.",
+				 "Name" : "CC-Transactions-GetAll",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT * FROM \"${GlueDatabase}\".\"${TransformedTransactionsTableName}\""
+				 }
+			}
+		},
+		"LoadPartitionsTransformedTableQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Loads new partitions of transformed credit card transaction data.",
+				 "Name" : "CC-Transactions-LoadNewPartitions",
+				 "QueryString" : {
+					"Fn::Sub" : "MSCK REPAIR TABLE ${TransformedTransactionsTableName}"
+				 }
+			}
+		},
+		"GetFraudTransactionsQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets transactions that were marked as fraud.",
+				 "Name" : "CC-Transactions-GetFraud",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT * FROM \"${GlueDatabase}\".\"${TransformedTransactionsTableName}\" WHERE fraud = 1"
+				 }
+			}
+		},
+		"GetTransactionCountQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets the total number of transactions.",
+				 "Name" : "CC-Transactions-GetCount",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT COUNT(*) AS TotalTransactions FROM \"${GlueDatabase}\".\"${TransformedTransactionsTableName}\""
+				 }
+			}
+		},
+		"GetTransactionFraudCountQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets the total number of fraudulent transactions.",
+				 "Name" : "CC-Transactions-GetFraudCount",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT COUNT(*) AS FraudulentTransactions FROM \"${GlueDatabase}\".\"${TransformedTransactionsTableName}\" WHERE fraud = 1"
+				 }
+			}
+		},
+		"GetTransactionPercentFraudQuery" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Gets the percentage of fraudulent transactions.",
+				 "Name" : "CC-Transactions-GetFraudPercent",
+				 "QueryString" : {
+					"Fn::Sub" : "SELECT fraud, 100.0 * COUNT(*) / SUM(COUNT(*)) OVER() AS Percent FROM \"${GlueDatabase}\".\"${TransformedTransactionsTableName}\" GROUP BY fraud"
+				 }
+			}
+		},
+
+		"CreateRawTable" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Creates the raw transactions table.",
+				 "Name" : "CC-Raw-Transactions-CreateTable",
+				 "QueryString" : {
+					"Fn::Join" : [
+						"",
+						[
+							{
+								"Fn::Sub" : "CREATE EXTERNAL TABLE IF NOT EXISTS `${RawTransactionsTableName}`(\n"
+							},
+							"`col0` bigint,\n",
+							"`col1` double,\n",
+							"`col2` double,\n",
+							"`col3` double,\n", 
+							"`col4` double,\n", 
+							"`col5` double,\n", 
+							"`col6` double,\n", 
+							"`col7` double,\n", 
+							"`col8` double,\n", 
+							"`col9` double,\n", 
+							"`col10` double,\n", 
+							"`col11` double,\n", 
+							"`col12` double,\n", 
+							"`col13` double,\n", 
+							"`col14` double,\n", 
+							"`col15` double,\n", 
+							"`col16` double,\n", 
+							"`col17` double,\n", 
+							"`col18` double,\n", 
+							"`col19` double,\n", 
+							"`col20` double,\n", 
+							"`col21` double,\n", 
+							"`col22` double,\n", 
+							"`col23` double,\n", 
+							"`col24` double,\n", 
+							"`col25` double,\n", 
+							"`col26` double,\n", 
+							"`col27` double,\n", 
+							"`col28` double,\n", 
+							"`col29` double,\n", 
+							"`col30` double,\n", 
+							"`col31` double,\n", 
+							"`col32` bigint,\n", 
+							"`col33` double)\n",
+							"ROW FORMAT DELIMITED\n", 
+							"FIELDS TERMINATED BY ','\n", 
+							"STORED AS INPUTFORMAT\n", 
+							"'org.apache.hadoop.mapred.TextInputFormat'\n",
+							"OUTPUTFORMAT\n",
+							"'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'\n",
+							"LOCATION\n",
+							{
+								"Fn::Sub" : "'s3://${CreditCardTransactionsBucketName}/'\n"
+							},
+							"TBLPROPERTIES (\n",							
+							"'classification'='csv',\n",
+							"'columnsOrdered'='true',\n",
+							"'compressionType'='none',\n",
+							"'delimiter'=',',\n",
+							{
+								"Fn::Sub" : "'exclusions'='[\"s3://${CreditCardTransactionsBucketName}/**processing-failed/**\"]',\n"
+							},							
+							"'typeOfData'='file')\n"
+						]
+					]
+				 }
+			}
+		},
+		"CreateRawTablePartitioned" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Creates the raw transactions table with partitioning.",
+				 "Name" : "CC-Raw-Transactions-CreateTablePartitioned",
+				 "QueryString" : {
+					"Fn::Join" : [
+						"",
+						[
+							{
+								"Fn::Sub" : "CREATE EXTERNAL TABLE IF NOT EXISTS `${RawTransactionsTableName}`(\n"
+							},
+							"`col0` bigint,\n",
+							"`col1` double,\n",
+							"`col2` double,\n",
+							"`col3` double,\n", 
+							"`col4` double,\n", 
+							"`col5` double,\n", 
+							"`col6` double,\n", 
+							"`col7` double,\n", 
+							"`col8` double,\n", 
+							"`col9` double,\n", 
+							"`col10` double,\n", 
+							"`col11` double,\n", 
+							"`col12` double,\n", 
+							"`col13` double,\n", 
+							"`col14` double,\n", 
+							"`col15` double,\n", 
+							"`col16` double,\n", 
+							"`col17` double,\n", 
+							"`col18` double,\n", 
+							"`col19` double,\n", 
+							"`col20` double,\n", 
+							"`col21` double,\n", 
+							"`col22` double,\n", 
+							"`col23` double,\n", 
+							"`col24` double,\n", 
+							"`col25` double,\n", 
+							"`col26` double,\n", 
+							"`col27` double,\n", 
+							"`col28` double,\n", 
+							"`col29` double,\n", 
+							"`col30` double,\n", 
+							"`col31` double,\n", 
+							"`col32` bigint,\n", 
+							"`col33` double)\n",
+							"PARTITIONED BY (\n", 
+							"`year` bigint,\n", 
+							"`month` bigint,\n", 
+							"`day` bigint,\n", 
+							"`hour` bigint)\n",
+							"ROW FORMAT DELIMITED\n", 
+							"FIELDS TERMINATED BY ','\n", 
+							"STORED AS INPUTFORMAT\n", 
+							"'org.apache.hadoop.mapred.TextInputFormat'\n",
+							"OUTPUTFORMAT\n",
+							"'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'\n",
+							"LOCATION\n",
+							{
+								"Fn::Sub" : "'s3://${CreditCardTransactionsBucketName}/'\n"
+							},
+							"TBLPROPERTIES (\n",							
+							"'classification'='csv',\n",
+							"'columnsOrdered'='true',\n",
+							"'compressionType'='none',\n",
+							"'delimiter'=',',\n",
+							{
+								"Fn::Sub" : "'exclusions'='[\"s3://${CreditCardTransactionsBucketName}/**processing-failed/**\"]',\n"
+							},							
+							"'typeOfData'='file')\n"
+						]
+					]
+				 }
+			}
+		},
+		"CreateTransformedTable" : {
+			"Type" : "AWS::Athena::NamedQuery",
+			"Properties" : {
+				 "Database" : {
+					"Ref" : "GlueDatabase"
+				 },
+				 "Description" : "Creates the transactions table.",
+				 "Name" : "CC-Transactions-CreateTable",
+				 "QueryString" : {
+					"Fn::Join" : [
+						"",
+						[
+							{
+								"Fn::Sub" : "CREATE EXTERNAL TABLE IF NOT EXISTS `${TransformedTransactionsTableName}`(\n"
+							},
+							"`timestamp` bigint,\n",
+							"`amount` double,\n", 
+							"`latitude` double,\n", 
+							"`longitude` double,\n", 
+							"`fraud` bigint,\n", 
+							"`score` double)\n",							
+							"ROW FORMAT SERDE \n",
+							"'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'\n",
+							"STORED AS INPUTFORMAT\n",
+							"'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'\n",
+							"OUTPUTFORMAT\n",
+							"'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'\n",
+							"LOCATION\n",
+							{
+								"Fn::Sub" : "'s3://${PostGlueETLS3Bucket}/'\n"
+							},
+							"TBLPROPERTIES (\n",							
+							"'classification'='parquet',\n",
+							"'compressionType'='none',\n",
+							{
+								"Fn::Sub" : "'exclusions'='[\"s3://${PostGlueETLS3Bucket}/**.json\",\"s3://${PostGlueETLS3Bucket}/_**\"]',\n"
+							},							
+							"'typeOfData'='file')\n"
+						]
+					]
+				 }
+			}
+		},
+
+		"RawTransactionsTable" : {
+			"Type" : "AWS::Glue::Table",
+			"Properties" : {
+				"DatabaseName" : {
+					"Ref" : "GlueDatabase"
+				},
+				"CatalogId" : {
+                    "Ref" : "AWS::AccountId"
+                },
+				"TableInput" : {
+					"Name" : {
+						"Ref" : "RawTransactionsTableName"
+					},
+					"Description" : "The raw cc transactions prior to ETL.",
+					"PartitionKeys" : [
+						{
+							"Name" : "year",
+							"Type" : "bigint"
+						},
+						{
+							"Name" : "month",
+							"Type" : "bigint"
+						},
+						{
+							"Name" : "day",
+							"Type" : "bigint"
+						},
+						{
+							"Name" : "hour",
+							"Type" : "bigint"
+						}
+					],
+					"TableType" : "EXTERNAL_TABLE",
+					"Parameters" : {
+						"EXTERNAL" : "TRUE",
+						"classification" : "csv",
+						"columnsOrdered" : "true",
+						"delimiter" : ",",
+						"typeOfData" : "file",
+						"compressionType" : "none",
+						"exclusions" : {
+							"Fn::Sub" : "[\"s3://${CreditCardTransactionsBucketName}/**processing-failed/**\"]"
+						}						
+					},
+					"StorageDescriptor" : {
+						"Columns" : [
+							{ 
+								"Name" : "col0",
+								"Type" : "bigint"
+							},
+							{ 
+								"Name" : "col1",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col2",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col3",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col4",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col5",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col6",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col7",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col8",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col9",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col10",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col11",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col12",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col13",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col14",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col15",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col16",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col17",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col18",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col19",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col20",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col21",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col22",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col23",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col24",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col25",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col26",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col27",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col28",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col29",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col30",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col31",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "col32",
+								"Type" : "bigint"
+							},
+							{ 
+								"Name" : "col33",
+								"Type" : "double"
+							}
+						],
+						"Location" : {
+							"Fn::Sub" : "s3://${CreditCardTransactionsBucketName}/"
+						},
+						"Compressed" : false,
+						"InputFormat" : "org.apache.hadoop.mapred.TextInputFormat",
+						"OutputFormat" : "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+						"SerdeInfo"    : {
+                            "SerializationLibrary" : "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+							"Parameters" : {
+								"field.delim" : ",",
+								"serialization.format" : ","
+							}
+                        }					
+					}
+				}
+			}
+		},
+		"FormattedTransactionsTable" : {
+			"Type" : "AWS::Glue::Table",
+			"Properties" : {
+				"DatabaseName" : {
+					"Ref" : "GlueDatabase"
+				},
+				"CatalogId" : {
+                    "Ref" : "AWS::AccountId"
+                },
+				"TableInput" : {
+					"Name" : {
+						"Ref" : "TransformedTransactionsTableName"
+					},
+					"Description" : "The formatted cc transactions post ETL.",
+					"TableType" : "EXTERNAL_TABLE",
+					"Parameters"  : {
+                        "EXTERNAL" : "TRUE",
+                        "classification" : "parquet",
+                        "compressionType" : "none",
+                        "typeOfData"      : "file",
+						"exclusions" : {
+							"Fn::Sub" : "[\"s3://${PostGlueETLS3Bucket}/**.json\",\"s3://${PostGlueETLS3Bucket}/_**\"]"
+						}
+                    },
+					"StorageDescriptor" : {
+						"Columns" : [
+							{ 
+								"Name" : "timestamp",
+								"Type" : "bigint"
+							},
+							{ 
+								"Name" : "amount",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "latitude",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "longitude",
+								"Type" : "double"
+							},
+							{ 
+								"Name" : "fraud",
+								"Type" : "bigint"
+							},
+							{ 
+								"Name" : "score",
+								"Type" : "double"
+							}
+						],
+						"Location" : {
+							"Fn::Sub" : "s3://${PostGlueETLS3Bucket}/"
+						},
+						"InputFormat" : "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+						"OutputFormat" : "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                        "SerdeInfo"    : {
+                            "Name" : "ParquetHiveSerDe",
+                            "SerializationLibrary" : "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                            "Parameters"           : {
+                                "serialization.format" : "1"
+                            }
+                        }					
+					}
+				}
+			}
+		},
+
+		"ETLJob" : {
+			"Type" : "AWS::Glue::Job",
+			"Properties" : {
+				"Role" : {
+                    "Ref" : "GlueServiceRole"
+                },
+                "DefaultArguments" : {
+                    "--job-bookmark-option" : "job-bookmark-enable",
+                    "--enable-metrics"      : "",
+                    "--TempDir"             : {
+                        "Fn::Sub" : "s3://aws-glue-temporary-${AWS::AccountId}-${AWS::Region}"
+                    }
+                },
+                "ExecutionProperty" : {
+                    "MaxConcurrentRuns" : 10
+                },
+                "MaxRetries"        : 0,
+                "Name"              : "CC Transaction Record Compaction",
+                "Description"       : "Performs an ETL on the raw cc transactions and converts to parquet.",
+                "Command"           : {
+                    "Name" : "glueetl",
+                    "ScriptLocation" : {
+						"Fn::If" : [
+							"SpecifiedScriptLocation",
+							{
+								"Ref" : "ETLScriptLocation"
+							},
+							{
+								"Fn::Sub" : "s3://aws-glue-scripts-${AWS::AccountId}-${AWS::Region}/admin/cc_etl.py"
+							}
+						]                 
+                    }
+                }            
+			}
+		},
+
+		"ETLTrigger" : {
+			"Type" : "AWS::Glue::Trigger",
+			"Properties" : {
+				"Actions" : [
+					{
+						"JobName" : {
+							"Ref" : "ETLJob"
+						},
+						"Arguments" : {
+							"--database" : {
+								"Ref" : "GlueDatabase"
+							},
+							"--table" : {
+								"Ref" : "RawTransactionsTable"
+							},
+							"--destination_bucket" : {
+								"Ref" : "PostGlueETLS3Bucket"
+							}
+						}
+					}
+				],
+				"Description" : "Runs an updated ETL job every 5 minutes.",
+				"Name" : "CC Transaction ETL Updates",
+				"Schedule" : "cron(*/5 * * * ? *)",
+				"Type" : "SCHEDULED"
+			}
+			
+		}
+    },
+
+
+    "Outputs"                  : {
+        "APIGatewayUrl" : {
+            "Description" : "The URL to access the new API.",
+            "Value"       : {
+                "Fn::Sub" : "https://${CreditCardTransactionApi}.execute-api.${AWS::Region}.amazonaws.com/stream/${StreamName}"
+            }
+        },
+		"SNSLambdaLauncherArn" : {
+			"Value" : {
+				"Ref" : "LambdaSNSLauncher"
+			}
+		}
+    }
+}
