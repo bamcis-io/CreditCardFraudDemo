@@ -14,7 +14,7 @@
     <PackageReference Include="AWSSDK.SimpleNotificationService" Version="3.3.101.28" />
     <PackageReference Include="AWSXRayRecorder" Version="2.6.2" />
     <PackageReference Include="BAMCIS.AWSLambda.Common" Version="2.0.1" />
-    <PackageReference Include="Newtonsoft.Json" Version="12.0.2" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
   </ItemGroup>
 
   <ItemGroup>
